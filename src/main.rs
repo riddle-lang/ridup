@@ -47,7 +47,14 @@ enum OverrideCommand {
 
 #[derive(Subcommand)]
 enum ToolchainCommand {
+    /// Link an existing local build or unpacked toolchain.
     Link { name: String, path: PathBuf },
+    /// Download a release channel or build Canary from source.
+    Install {
+        #[arg(value_parser = ["stable", "nightly", "canary"])]
+        channel: String,
+    },
+    /// List installed and linked toolchains.
     List,
 }
 
@@ -86,6 +93,16 @@ fn main() -> anyhow::Result<()> {
             ToolchainCommand::Link { name, path } => {
                 let path = ridup::link_toolchain(&home, &name, &path)?;
                 println!("ridup: linked `{name}` to `{}`", path.display());
+            }
+            ToolchainCommand::Install { channel } => {
+                let channel = channel.parse::<ridup::ReleaseChannel>()?;
+                println!("ridup: installing `{}`...", channel.as_str());
+                let path = ridup::install_toolchain(&home, channel)?;
+                println!(
+                    "ridup: installed `{}` at `{}`",
+                    channel.as_str(),
+                    path.display()
+                );
             }
             ToolchainCommand::List => {
                 for name in ridup::list_toolchains(&home)? {

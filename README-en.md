@@ -21,13 +21,46 @@ ridup run dev clue --version
 `ridup toolchain list` lists linked toolchains. A linked directory may contain
 components directly, as Cargo's `target/debug` does, or under `bin/`.
 
+## Release channels
+
+Riddle has three release channels:
+
+| Channel | Source | Intended use |
+| --- | --- | --- |
+| `stable` | Latest formal [GitHub Release](https://github.com/riddle-lang/riddle/releases/latest) | Daily use with full validation |
+| `nightly` | Daily [Nightly Release](https://github.com/riddle-lang/riddle/releases/tag/nightly) | Trying the latest changes collected that day |
+| `canary` | Latest source compiled locally | Earliest validation of new commits; may break at any time |
+
+Install the desired channels directly:
+
+```powershell
+ridup toolchain install stable
+ridup toolchain install nightly
+ridup toolchain install canary
+ridup default stable
+```
+
+Running an install command again updates that channel. For `stable` and
+`nightly`, ridup selects the host release archive and verifies GitHub's SHA-256
+digest before replacing the previous toolchain. For `canary`, ridup downloads
+the latest `main` commit, runs `cargo build --workspace --release` locally, and
+installs `clue`, `riddlec`, and `riddle-lsp`. Installing `canary` therefore
+requires Rust and Cargo, but not Git.
+
+Downloads and Canary builds honor standard proxy environment variables:
+
+```powershell
+$env:HTTPS_PROXY = "http://127.0.0.1:7890"
+ridup toolchain install stable
+```
+
 ## Project selection
 
 Pin a project with `riddle-toolchain.toml`:
 
 ```toml
 [toolchain]
-channel = "0.1.1-x86_64-pc-windows-msvc"
+channel = "canary"
 ```
 
 Selection precedence is:
@@ -43,6 +76,5 @@ When the ridup executable is installed under the names `clue`, `riddlec`, and
 toolchain. Release packaging or an installer should create those proxy copies or
 hard links.
 
-Remote download and C compiler installation are intentionally not implemented
-yet. `toolchain link` provides the version-selection contract while the release
-archive manifest and download verification format are still being defined.
+C compiler installation is not implemented; the selected `clue` continues to
+use a C compiler already available on the host.

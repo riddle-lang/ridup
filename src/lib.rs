@@ -1,13 +1,358 @@
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::fs;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
+use std::str::FromStr;
+use std::time::Duration;
+use zip::ZipArchive;
 
 pub const PROJECT_TOOLCHAIN_FILE: &str = "riddle-toolchain.toml";
+const GITHUB_REPOSITORY: &str = "riddle-lang/riddle";
+const HTTP_TIMEOUT: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseChannel {
+    Stable,
+    Nightly,
+    Canary,
+}
+
+impl FromStr for ReleaseChannel {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "stable" => Ok(Self::Stable),
+            "nightly" => Ok(Self::Nightly),
+            "canary" => Ok(Self::Canary),
+            _ => bail!("unknown release channel `{value}`; expected stable, nightly, or canary"),
+        }
+    }
+}
+
+impl ReleaseChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Nightly => "nightly",
+            Self::Canary => "canary",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseResponse {
+    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitResponse {
+    sha: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReleaseAsset {
+    pub name: String,
+    pub browser_download_url: String,
+    pub digest: Option<String>,
+}
+
+pub fn install_toolchain(home: &Path, channel: ReleaseChannel) -> anyhow::Result<PathBuf> {
+    match channel {
+        ReleaseChannel::Canary => install_canary(home),
+        ReleaseChannel::Stable | ReleaseChannel::Nightly => install_release(home, channel),
+    }
+}
+
+fn install_release(home: &Path, channel: ReleaseChannel) -> anyhow::Result<PathBuf> {
+    let agent = github_agent();
+    let release_url = match channel {
+        ReleaseChannel::Stable => {
+            format!("https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest")
+        }
+        ReleaseChannel::Nightly => {
+            format!("https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/tags/nightly")
+        }
+        ReleaseChannel::Canary => unreachable!(),
+    };
+    let release: ReleaseResponse = agent
+        .get(&release_url)
+        .header("User-Agent", "ridup")
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .with_context(|| format!("failed to query {channel:?} release"))?
+        .body_mut()
+        .read_json()
+        .context("invalid GitHub release response")?;
+    let suffix = release_asset_suffix(std::env::consts::OS, std::env::consts::ARCH)?;
+    let asset = select_release_asset(&release.assets, &suffix)?;
+    let bytes = download_bytes(
+        &agent,
+        &asset.browser_download_url,
+        &format!("release asset `{}`", asset.name),
+        128 * 1024 * 1024,
+    )?;
+    if let Some(digest) = &asset.digest {
+        verify_digest(&bytes, digest)?;
+    } else {
+        bail!("release asset `{}` has no SHA-256 digest", asset.name);
+    }
+    let install_root = home.join("toolchains").join(channel.as_str());
+    let temp_root = temporary_install_root(home, channel.as_str());
+    prepare_temp_root(&temp_root)?;
+    extract_archive(&bytes, &temp_root)?;
+    validate_toolchain_root(&temp_root)?;
+    replace_install_root(&temp_root, &install_root)?;
+    link_toolchain(home, channel.as_str(), &install_root)
+}
+
+fn github_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .https_only(true)
+        .timeout_global(Some(HTTP_TIMEOUT))
+        .build()
+        .into()
+}
+
+fn install_canary(home: &Path) -> anyhow::Result<PathBuf> {
+    let agent = github_agent();
+    let commit_url = format!("https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/main");
+    let commit: CommitResponse = agent
+        .get(&commit_url)
+        .header("User-Agent", "ridup")
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .context("failed to query the latest canary commit")?
+        .body_mut()
+        .read_json()
+        .context("invalid GitHub commit response")?;
+    let archive_url = format!(
+        "https://github.com/{GITHUB_REPOSITORY}/archive/{}.zip",
+        commit.sha
+    );
+    let bytes = download_bytes(
+        &agent,
+        &archive_url,
+        "canary source archive",
+        128 * 1024 * 1024,
+    )?;
+
+    let sources = home.join("sources");
+    fs::create_dir_all(&sources)?;
+    let download_root = sources.join(format!(".riddle.download-{}", std::process::id()));
+    prepare_temp_root(&download_root)?;
+    extract_archive(&bytes, &download_root)?;
+    let archive_root = single_directory(&download_root)?;
+    let source = home.join("sources").join("riddle");
+    replace_install_root(&archive_root, &source)?;
+    fs::remove_dir(download_root)?;
+
+    let cargo_target = home.join("build").join("canary");
+    let status = Command::new("cargo")
+        .current_dir(&source)
+        .args(["build", "--workspace", "--release"])
+        .env("CARGO_TARGET_DIR", &cargo_target)
+        .status()
+        .context("failed to run `cargo`")?;
+    if !status.success() {
+        bail!("canary build failed with status {status}");
+    }
+    let build_root = cargo_target.join("release");
+    let install_root = home.join("toolchains").join("canary");
+    let temp_root = temporary_install_root(home, "canary");
+    prepare_temp_root(&temp_root)?;
+    for component in ["clue", "riddlec", "riddle-lsp"] {
+        let source_path = component_path(&build_root, component)?;
+        let target_name = source_path
+            .file_name()
+            .context("component has no file name")?;
+        fs::copy(&source_path, temp_root.join(target_name))
+            .with_context(|| format!("failed to install `{component}`"))?;
+    }
+    replace_install_root(&temp_root, &install_root)?;
+    link_toolchain(home, "canary", &install_root)
+}
+
+fn download_bytes(
+    agent: &ureq::Agent,
+    url: &str,
+    description: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let mut response = agent
+        .get(url)
+        .header("User-Agent", "ridup")
+        .call()
+        .with_context(|| format!("failed to download {description}"))?;
+    let mut bytes = Vec::new();
+    response
+        .body_mut()
+        .as_reader()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {description}"))?;
+    if bytes.len() > limit {
+        bail!(
+            "{description} exceeds the {} MiB limit",
+            limit / 1024 / 1024
+        );
+    }
+    Ok(bytes)
+}
+
+fn single_directory(root: &Path) -> anyhow::Result<PathBuf> {
+    let mut entries = fs::read_dir(root)?;
+    let entry = entries
+        .next()
+        .transpose()?
+        .context("source archive is empty")?;
+    if entries.next().transpose()?.is_some() || !entry.path().is_dir() {
+        bail!("source archive must contain exactly one top-level directory");
+    }
+    Ok(entry.path())
+}
+
+fn temporary_install_root(home: &Path, channel: &str) -> PathBuf {
+    home.join("toolchains")
+        .join(format!(".{channel}.install-{}", std::process::id()))
+}
+
+fn prepare_temp_root(temp_root: &Path) -> anyhow::Result<()> {
+    if temp_root.exists() {
+        fs::remove_dir_all(temp_root)?;
+    }
+    fs::create_dir_all(temp_root).map_err(Into::into)
+}
+
+fn replace_install_root(temp_root: &Path, install_root: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = install_root.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let name = install_root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("install root has no valid directory name")?;
+    let backup_root = install_root.with_file_name(format!(".{name}.backup-{}", std::process::id()));
+    if backup_root.exists() {
+        fs::remove_dir_all(&backup_root)?;
+    }
+    let had_existing = install_root.exists();
+    if had_existing {
+        fs::rename(install_root, &backup_root)
+            .with_context(|| format!("failed to replace `{}`", install_root.display()))?;
+    }
+    if let Err(error) = fs::rename(temp_root, install_root) {
+        if had_existing {
+            fs::rename(&backup_root, install_root).with_context(|| {
+                format!(
+                    "failed to restore previous toolchain from `{}`",
+                    backup_root.display()
+                )
+            })?;
+        }
+        return Err(error)
+            .with_context(|| format!("failed to activate `{}`", install_root.display()));
+    }
+    if had_existing {
+        fs::remove_dir_all(backup_root)?;
+    }
+    Ok(())
+}
+
+fn extract_archive(bytes: &[u8], destination: &Path) -> anyhow::Result<()> {
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).context("invalid toolchain archive")?;
+    let mut extracted_size = 0_u64;
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index)?;
+        #[cfg(unix)]
+        let unix_mode = file.unix_mode();
+        extracted_size = extracted_size
+            .checked_add(file.size())
+            .context("toolchain archive size overflow")?;
+        if extracted_size > 256 * 1024 * 1024 {
+            bail!("toolchain archive expands beyond 256 MiB");
+        }
+        let relative = file
+            .enclosed_name()
+            .context("toolchain archive contains an unsafe path")?
+            .to_owned();
+        let output = destination.join(relative);
+        if file.is_dir() {
+            fs::create_dir_all(&output)?;
+        } else {
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            fs::write(&output, bytes)?;
+            #[cfg(unix)]
+            if let Some(mode) = unix_mode {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&output, fs::Permissions::from_mode(mode))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_toolchain_root(root: &Path) -> anyhow::Result<()> {
+    for component in ["clue", "riddlec", "riddle-lsp"] {
+        component_path(root, component)?;
+    }
+    Ok(())
+}
+
+fn release_asset_suffix(os: &str, arch: &str) -> anyhow::Result<String> {
+    let platform = match os {
+        "windows" => "windows",
+        "linux" => "linux",
+        "macos" => "macos",
+        _ => bail!("unsupported host operating system `{os}`"),
+    };
+    let architecture = match arch {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        "x86" => "i686",
+        _ => bail!("unsupported host architecture `{arch}`"),
+    };
+    if platform == "macos" && architecture != "aarch64" {
+        bail!("no macOS {architecture} release is available");
+    }
+    Ok(format!("{platform}-{architecture}.zip"))
+}
+
+fn select_release_asset<'a>(
+    assets: &'a [ReleaseAsset],
+    suffix: &str,
+) -> anyhow::Result<&'a ReleaseAsset> {
+    assets
+        .iter()
+        .find(|asset| asset.name.ends_with(suffix))
+        .ok_or_else(|| anyhow::anyhow!("release does not contain a `{suffix}` asset"))
+}
+
+fn verify_digest(bytes: &[u8], digest: &str) -> anyhow::Result<()> {
+    let expected = digest
+        .strip_prefix("sha256:")
+        .context("release asset digest is not SHA-256")?;
+    let mut actual = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(actual, "{byte:02x}").unwrap();
+    }
+    if actual == expected {
+        Ok(())
+    } else {
+        bail!("release asset SHA-256 mismatch: expected {expected}, got {actual}")
+    }
+}
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Config {
@@ -109,7 +454,9 @@ pub fn list_toolchains(home: &Path) -> anyhow::Result<Vec<String>> {
     let mut names = config.toolchains.keys().cloned().collect::<BTreeSet<_>>();
     if let Ok(entries) = fs::read_dir(home.join("toolchains")) {
         for entry in entries.flatten().filter(|entry| entry.path().is_dir()) {
-            if let Some(name) = entry.file_name().to_str() {
+            if let Some(name) = entry.file_name().to_str()
+                && !name.starts_with('.')
+            {
                 names.insert(name.to_owned());
             }
         }
@@ -255,6 +602,7 @@ pub fn proxy_name(executable: &OsStr) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -345,5 +693,132 @@ mod tests {
         let mut args = vec![OsString::from("build")];
         assert_eq!(take_toolchain_override(&mut args).unwrap(), None);
         assert_eq!(args, [OsString::from("build")]);
+    }
+
+    #[test]
+    fn parses_only_installable_release_channels() {
+        assert_eq!(
+            ReleaseChannel::from_str("stable").unwrap(),
+            ReleaseChannel::Stable
+        );
+        assert_eq!(
+            ReleaseChannel::from_str("nightly").unwrap(),
+            ReleaseChannel::Nightly
+        );
+        assert_eq!(
+            ReleaseChannel::from_str("canary").unwrap(),
+            ReleaseChannel::Canary
+        );
+        assert!(ReleaseChannel::from_str("beta").is_err());
+    }
+
+    #[test]
+    fn maps_supported_hosts_to_release_asset_suffixes() {
+        assert_eq!(
+            release_asset_suffix("windows", "x86_64").unwrap(),
+            "windows-x86_64.zip"
+        );
+        assert_eq!(
+            release_asset_suffix("linux", "x86").unwrap(),
+            "linux-i686.zip"
+        );
+        assert_eq!(
+            release_asset_suffix("macos", "aarch64").unwrap(),
+            "macos-aarch64.zip"
+        );
+        assert!(release_asset_suffix("macos", "x86_64").is_err());
+    }
+
+    #[test]
+    fn selects_only_the_matching_platform_archive() {
+        let assets = vec![
+            ReleaseAsset {
+                name: "riddle-v0.1.1-windows-x86_64.zip".into(),
+                browser_download_url: "https://example.invalid/windows".into(),
+                digest: Some("sha256:windows".into()),
+            },
+            ReleaseAsset {
+                name: "riddle-v0.1.1-linux-x86_64.zip".into(),
+                browser_download_url: "https://example.invalid/linux".into(),
+                digest: Some("sha256:linux".into()),
+            },
+        ];
+
+        assert_eq!(
+            select_release_asset(&assets, "windows-x86_64.zip")
+                .unwrap()
+                .browser_download_url,
+            "https://example.invalid/windows"
+        );
+        assert!(select_release_asset(&assets, "windows-aarch64.zip").is_err());
+    }
+
+    #[test]
+    fn verifies_github_sha256_digests() {
+        const EMPTY_SHA256: &str =
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(verify_digest(&[], EMPTY_SHA256).is_ok());
+        assert!(verify_digest(b"changed", EMPTY_SHA256).is_err());
+        assert!(verify_digest(&[], "md5:unsupported").is_err());
+    }
+
+    #[test]
+    fn keeps_existing_toolchain_when_activation_fails() {
+        let root = temp_root("activation-rollback");
+        let install_root = root.join("stable");
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("old"), b"working").unwrap();
+
+        assert!(replace_install_root(&root.join("missing"), &install_root).is_err());
+        assert_eq!(fs::read(install_root.join("old")).unwrap(), b"working");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn requires_every_proxy_component_before_activation() {
+        let root = temp_root("complete-toolchain");
+        fs::create_dir_all(&root).unwrap();
+        assert!(validate_toolchain_root(&root).is_err());
+        for component in ["clue", "riddlec", "riddle-lsp"] {
+            let name = if cfg!(windows) {
+                format!("{component}.exe")
+            } else {
+                component.to_owned()
+            };
+            fs::write(root.join(name), b"binary").unwrap();
+        }
+        assert!(validate_toolchain_root(&root).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn toolchain_list_ignores_interrupted_install_directories() {
+        let root = temp_root("hidden-installs");
+        fs::create_dir_all(root.join("toolchains/stable")).unwrap();
+        fs::create_dir_all(root.join("toolchains/.stable.install-1")).unwrap();
+        fs::create_dir_all(root.join("toolchains/.stable.backup-1")).unwrap();
+        assert_eq!(list_toolchains(&root).unwrap(), ["stable"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn release_download_allows_slow_connections() {
+        assert!(HTTP_TIMEOUT >= std::time::Duration::from_secs(300));
+    }
+
+    #[test]
+    fn github_client_rejects_plaintext_redirects() {
+        assert!(github_agent().config().https_only());
+    }
+
+    #[test]
+    fn locates_the_single_source_archive_root() {
+        let root = temp_root("source-archive-root");
+        let source = root.join("riddle-commit");
+        fs::create_dir_all(&source).unwrap();
+        assert_eq!(single_directory(&root).unwrap(), source);
+        fs::create_dir_all(root.join("unexpected")).unwrap();
+        assert!(single_directory(&root).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 }
