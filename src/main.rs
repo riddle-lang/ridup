@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::env;
 use std::ffi::OsString;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -23,6 +24,14 @@ enum Commands {
     Toolchain {
         #[command(subcommand)]
         command: ToolchainCommand,
+    },
+    Target {
+        #[command(subcommand)]
+        command: TargetCommand,
+    },
+    CToolchain {
+        #[command(subcommand)]
+        command: CToolchainCommand,
     },
     Run {
         toolchain: String,
@@ -56,6 +65,54 @@ enum ToolchainCommand {
     },
     /// List installed and linked toolchains.
     List,
+}
+
+#[derive(Subcommand)]
+enum TargetCommand {
+    /// Install a target runtime component.
+    Add {
+        triple: String,
+        #[arg(long)]
+        toolchain: Option<String>,
+        /// Install the matching C compiler without prompting.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Remove an installed target component and its C configuration.
+    Remove {
+        triple: String,
+        #[arg(long)]
+        toolchain: Option<String>,
+    },
+    /// List target-component and C-toolchain readiness separately.
+    List {
+        #[arg(long)]
+        toolchain: Option<String>,
+    },
+    /// Configure C compiler, sysroot, or platform SDK paths.
+    Configure {
+        triple: String,
+        #[arg(long)]
+        toolchain: Option<String>,
+        #[arg(long)]
+        compiler: Option<PathBuf>,
+        #[arg(long)]
+        sysroot: Option<PathBuf>,
+        #[arg(long)]
+        windows_sdk: Option<PathBuf>,
+        #[arg(long)]
+        msvc: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CToolchainCommand {
+    /// Detect or install the matching Clang/LLD toolchain.
+    Install {
+        triple: String,
+        #[arg(long)]
+        toolchain: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -110,6 +167,98 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         },
+        Commands::Target { command } => match command {
+            TargetCommand::Add {
+                triple,
+                toolchain,
+                yes,
+            } => {
+                let active = active_toolchain(&home, toolchain.as_deref())?;
+                let installed = ridup::install_target(&home, &active, &triple)?;
+                if installed.native {
+                    println!(
+                        "ridup: target `{}` is included in the host toolchain",
+                        installed.triple
+                    );
+                    let status = status_for(&active, installed.triple)?;
+                    if !status.c_toolchain_ready {
+                        println!("  C toolchain: {}", status.reason);
+                        if yes || confirm_c_install(&installed.llvm_version)? {
+                            install_c_toolchain(&active, installed.triple)?;
+                        }
+                    }
+                } else {
+                    println!("ridup: installed target `{}`", installed.triple);
+                    println!("  release: {}", installed.release_version);
+                    println!("  runtime: {}", installed.runtime.unwrap().display());
+                    println!("  LLVM/Clang baseline: {}", installed.llvm_version);
+                    let status = status_for(&active, installed.triple)?;
+                    if !status.c_toolchain_ready {
+                        println!("  C toolchain: {}", status.reason);
+                        let install = yes || confirm_c_install(&installed.llvm_version)?;
+                        if install {
+                            install_c_toolchain(&active, installed.triple)?;
+                        } else {
+                            println!(
+                                "ridup: target component installed; configure C later with `ridup c-toolchain install {}`",
+                                installed.triple
+                            );
+                        }
+                    }
+                }
+            }
+            TargetCommand::Remove { triple, toolchain } => {
+                let active = active_toolchain(&home, toolchain.as_deref())?;
+                ridup::remove_target(&active, &triple)?;
+                println!("ridup: removed target `{triple}` from `{}`", active.name);
+            }
+            TargetCommand::List { toolchain } => {
+                let active = active_toolchain(&home, toolchain.as_deref())?;
+                for status in ridup::list_targets(&active)? {
+                    println!(
+                        "{}  component={}  c-toolchain={}  {}",
+                        status.triple,
+                        if status.installed {
+                            "installed"
+                        } else {
+                            "missing"
+                        },
+                        if status.c_toolchain_ready {
+                            "ready"
+                        } else {
+                            "missing"
+                        },
+                        status.reason
+                    );
+                }
+            }
+            TargetCommand::Configure {
+                triple,
+                toolchain,
+                compiler,
+                sysroot,
+                windows_sdk,
+                msvc,
+            } => {
+                let active = active_toolchain(&home, toolchain.as_deref())?;
+                let path = ridup::configure_target(
+                    &active,
+                    &triple,
+                    compiler,
+                    sysroot,
+                    windows_sdk,
+                    msvc,
+                )?;
+                println!("ridup: wrote `{}`", path.display());
+                print_target_status(&status_for(&active, &triple)?);
+            }
+        },
+        Commands::CToolchain { command } => match command {
+            CToolchainCommand::Install { triple, toolchain } => {
+                let active = active_toolchain(&home, toolchain.as_deref())?;
+                install_c_toolchain(&active, &triple)?;
+            }
+        },
         Commands::Run {
             toolchain,
             component,
@@ -120,6 +269,67 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn active_toolchain(
+    home: &std::path::Path,
+    explicit: Option<&str>,
+) -> anyhow::Result<ridup::ActiveToolchain> {
+    ridup::resolve_toolchain(home, &env::current_dir()?, explicit)
+}
+
+fn status_for(
+    active: &ridup::ActiveToolchain,
+    triple: &str,
+) -> anyhow::Result<ridup::TargetStatus> {
+    ridup::list_targets(active)?
+        .into_iter()
+        .find(|status| status.triple == triple)
+        .ok_or_else(|| anyhow::anyhow!("unsupported target `{triple}`"))
+}
+
+fn install_c_toolchain(active: &ridup::ActiveToolchain, triple: &str) -> anyhow::Result<()> {
+    println!(
+        "ridup: installing or detecting LLVM {}...",
+        ridup::LLVM_VERSION
+    );
+    let installed = ridup::install_c_toolchain(active, triple)?;
+    println!("ridup: C compiler `{}`", installed.compiler.display());
+    println!("  config: {}", installed.config_path.display());
+    print_target_status(&installed.status);
+    Ok(())
+}
+
+fn print_target_status(status: &ridup::TargetStatus) {
+    println!(
+        "  target {}: component={}, C toolchain={} ({})",
+        status.triple,
+        if status.installed {
+            "installed"
+        } else {
+            "missing"
+        },
+        if status.c_toolchain_ready {
+            "ready"
+        } else {
+            "incomplete"
+        },
+        status.reason
+    );
+}
+
+fn confirm_c_install(version: &str) -> anyhow::Result<bool> {
+    if !io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    print!("Install the matching LLVM/Clang {version} C toolchain now? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn run_proxy(component: &str) -> anyhow::Result<()> {

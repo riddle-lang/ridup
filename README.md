@@ -4,7 +4,7 @@
     <a href="README-en.md">English</a> | <a href="README.md">中文</a>
 </h3>
 
-`ridup` 用于选择并运行已安装的 Riddle 工具链，负责管理 Riddle 版本；被选中的 `clue` 仍负责寻找当前机器上的 C 编译器。
+`ridup` 用于选择并运行已安装的 Riddle 工具链，负责管理 Riddle 版本、目标组件以及交叉编译所需的 C 工具链配置。
 
 ## 本地工具链
 
@@ -40,12 +40,47 @@ ridup default stable
 
 重复执行安装命令即可更新对应通道。`stable` 和 `nightly` 会自动选择当前系统的发布归档，验证 GitHub 提供的 SHA-256 后再替换旧工具链。`canary` 会下载 `main` 最新提交的源码，在本机执行 `cargo build --workspace --release`，然后安装 `clue`、`riddlec` 和 `riddle-lsp`；因此安装 `canary` 需要本机已有 Rust 和 Cargo，不需要 Git。
 
+工具链实际目录使用完整宿主 triple，例如 `stable-x86_64-pc-windows-msvc`；`stable`、`nightly` 和 `canary` 仍是指向对应宿主工具链的便捷名称。
+
 下载和 Canary 构建都会使用标准代理环境变量：
 
 ```powershell
 $env:HTTPS_PROXY = "http://127.0.0.1:7890"
 ridup toolchain install stable
 ```
+
+## 目标组件与交叉编译
+
+给当前工具链安装、查看或删除目标组件：
+
+```powershell
+ridup target add aarch64-unknown-linux-gnu
+ridup target list
+ridup target remove aarch64-unknown-linux-gnu
+```
+
+`target add` 会显示安装的 Riddle runtime、发行版本和 LLVM/Clang 基线，然后询问是否安装匹配的 C 编译器。使用 `--yes` 可以在非交互环境中自动确认；不确认也会保留已经安装的目标组件。
+
+首版只支持以下 7 个 triple，其他值会直接报错：
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `i686-unknown-linux-gnu`
+- `x86_64-pc-windows-msvc`
+- `i686-pc-windows-msvc`
+- `aarch64-pc-windows-msvc`
+- `aarch64-apple-darwin`
+
+目标组件和 C 工具链是两个独立状态。`ridup target list` 会分别显示 `component=installed|missing` 和 `c-toolchain=ready|missing`。可以单独安装或配置 C 工具链：
+
+```powershell
+ridup c-toolchain install aarch64-unknown-linux-gnu
+ridup target configure aarch64-unknown-linux-gnu --compiler C:\LLVM\bin\clang.exe --sysroot D:\sysroots\aarch64-linux-gnu
+```
+
+ridup 优先复用系统已有的 Clang。缺失时会尝试安装发行清单指定的 LLVM 22.1.3：Windows 使用 `winget`，Debian/Ubuntu 使用 `apt-get`，macOS 使用 Homebrew；包管理器不可用或没有该版本时会保留目标组件，并给出手动配置命令。
+
+Clang/LLD 本身不包含所有目标系统库。Linux 交叉目标还需要 sysroot；从非 Windows 宿主生成 MSVC 程序需要 Windows SDK 和 MSVC 库；生成 macOS 程序需要 Apple SDK。ridup 不会分发专有 SDK，也不会把缺少 SDK/sysroot 的目标标为就绪。所有目标命令都可用 `--toolchain <name>` 指定工具链。
 
 ## 项目选择
 
@@ -64,6 +99,4 @@ channel = "canary"
 4. 最近的 `riddle-toolchain.toml`；
 5. 默认工具链。
 
-当把 ridup 可执行文件安装为 `clue`、`riddlec` 或 `riddle-lsp` 时，它会作为代理，从选中的工具链中执行对应组件。发行打包或安装器需要创建这些代理副本或硬链接。
-
-C 编译器安装目前尚未实现；被选中的 `clue` 仍使用当前机器上已有的 C 编译器。
+当把 ridup 可执行文件安装为 `clue`、`riddlec` 或 `riddle-lsp` 时，它会作为代理，从选中的工具链中执行对应组件，并把工具链根目录传给 Clue，使其读取已安装的目标和 C 配置。发行打包或安装器需要创建这些代理副本或硬链接。
