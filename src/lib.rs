@@ -198,7 +198,7 @@ fn install_canary(home: &Path) -> anyhow::Result<PathBuf> {
     let install_root = home.join("toolchains").join(&install_name);
     let temp_root = temporary_install_root(home, &install_name);
     prepare_temp_root(&temp_root)?;
-    for component in ["clue", "riddlec", "riddle-lsp"] {
+    for component in ["clue", "riddlec", "riddle", "riddle-lsp"] {
         let source_path = component_path(&build_root, component)?;
         let target_name = source_path
             .file_name()
@@ -799,7 +799,7 @@ fn extract_archive(bytes: &[u8], destination: &Path) -> anyhow::Result<()> {
 }
 
 fn validate_toolchain_root(root: &Path) -> anyhow::Result<()> {
-    for component in ["clue", "riddlec", "riddle-lsp"] {
+    for component in ["clue", "riddlec", "riddle", "riddle-lsp"] {
         component_path(root, component)?;
     }
     Ok(())
@@ -1092,7 +1092,7 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
 
 pub fn proxy_name(executable: &OsStr) -> Option<&str> {
     let stem = Path::new(executable).file_stem()?.to_str()?;
-    matches!(stem, "clue" | "riddlec" | "riddle-lsp").then_some(stem)
+    matches!(stem, "clue" | "riddlec" | "riddle" | "riddle-lsp").then_some(stem)
 }
 
 #[cfg(test)]
@@ -1344,7 +1344,7 @@ sha256 = "11"
         let root = temp_root("complete-toolchain");
         fs::create_dir_all(&root).unwrap();
         assert!(validate_toolchain_root(&root).is_err());
-        for component in ["clue", "riddlec", "riddle-lsp"] {
+        for component in ["clue", "riddlec", "riddle", "riddle-lsp"] {
             let name = if cfg!(windows) {
                 format!("{component}.exe")
             } else {
@@ -1354,6 +1354,14 @@ sha256 = "11"
         }
         assert!(validate_toolchain_root(&root).is_ok());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recognizes_all_proxy_component_names() {
+        for name in ["clue", "riddlec", "riddle", "riddle-lsp"] {
+            assert_eq!(proxy_name(std::ffi::OsStr::new(name)), Some(name));
+        }
+        assert_eq!(proxy_name(std::ffi::OsStr::new("other")), None);
     }
 
     #[test]

@@ -38,9 +38,11 @@ ridup toolchain install canary
 ridup default stable
 ```
 
-重复执行安装命令即可更新对应通道。`stable` 和 `nightly` 会自动选择当前系统的发布归档，验证 GitHub 提供的 SHA-256 后再替换旧工具链。`canary` 会下载 `main` 最新提交的源码，在本机执行 `cargo build --workspace --release`，然后安装 `clue`、`riddlec` 和 `riddle-lsp`；因此安装 `canary` 需要本机已有 Rust 和 Cargo，不需要 Git。
+重复执行安装命令即可更新对应通道。`stable` 和 `nightly` 会自动选择当前系统的发布归档，验证 GitHub 提供的 SHA-256 后再替换旧工具链。`canary` 会下载 `main` 最新提交的源码，在本机执行 `cargo build --workspace --release`，然后安装 `clue`、`riddlec`、`riddle` 和 `riddle-lsp`；因此安装 `canary` 需要本机已有 Rust 和 Cargo，不需要 Git。
 
 工具链实际目录使用完整宿主 triple，例如 `stable-x86_64-pc-windows-msvc`；`stable`、`nightly` 和 `canary` 仍是指向对应宿主工具链的便捷名称。
+
+其中 `riddle` 提供统一工具入口，当前可用 `riddle fmt` 格式化 Riddle 源码或检查格式。
 
 下载和 Canary 构建都会使用标准代理环境变量：
 
@@ -99,4 +101,4 @@ channel = "canary"
 4. 最近的 `riddle-toolchain.toml`；
 5. 默认工具链。
 
-当把 ridup 可执行文件安装为 `clue`、`riddlec` 或 `riddle-lsp` 时，它会作为代理，从选中的工具链中执行对应组件，并把工具链根目录传给 Clue，使其读取已安装的目标和 C 配置。发行打包或安装器需要创建这些代理副本或硬链接。
+当把 ridup 可执行文件安装为 `clue`、`riddlec`、`riddle` 或 `riddle-lsp` 时，它会作为代理，从选中的工具链中执行对应组件，并把工具链根目录传给 Clue，使其读取已安装的目标和 C 配置。发行打包或安装器需要创建这些代理副本或硬链接。

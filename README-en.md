@@ -44,12 +44,15 @@ Running an install command again updates that channel. For `stable` and
 `nightly`, ridup selects the host release archive and verifies GitHub's SHA-256
 digest before replacing the previous toolchain. For `canary`, ridup downloads
 the latest `main` commit, runs `cargo build --workspace --release` locally, and
-installs `clue`, `riddlec`, and `riddle-lsp`. Installing `canary` therefore
+installs `clue`, `riddlec`, `riddle`, and `riddle-lsp`. Installing `canary` therefore
 requires Rust and Cargo, but not Git.
 
 The actual toolchain directory uses the full host triple, for example
 `stable-x86_64-pc-windows-msvc`. `stable`, `nightly`, and `canary` remain
 convenient aliases for the corresponding host toolchain.
+
+The `riddle` component provides the unified tools entry point; currently,
+`riddle fmt` formats Riddle source or checks its formatting.
 
 Downloads and Canary builds honor standard proxy environment variables:
 
@@ -123,8 +126,8 @@ Selection precedence is:
 4. The nearest `riddle-toolchain.toml`.
 5. The default toolchain.
 
-When the ridup executable is installed under the names `clue`, `riddlec`, and
-`riddle-lsp`, it acts as a proxy, executes that component from the selected
+When the ridup executable is installed under the names `clue`, `riddlec`,
+`riddle`, and `riddle-lsp`, it acts as a proxy, executes that component from the selected
 toolchain, and passes the toolchain root to Clue so it can load installed targets
 and C configuration. Release packaging or an installer should create those
 proxy copies or hard links.
